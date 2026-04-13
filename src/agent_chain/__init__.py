@@ -1,4 +1,4 @@
-"""agent-chain: Blockchain-structured AI Agent system."""
+"""agent-chain: multi-agent orchestration with hash-linked block chain audit trail."""
 
 from .block import Block, BlockHeader
 from .ledger import ImmutableLedger

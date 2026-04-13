@@ -43,7 +43,7 @@ class LLMAgent(BaseAgent):
         self,
         *,
         backend: LLMBackend,
-        system_prompt: str = "You are a helpful assistant.",
+        system_prompt: str = "",
         agent_id: str | None = None,
         role: str = "llm_agent",
     ) -> None:
