@@ -80,10 +80,16 @@ class ImmutableLedger:
     @classmethod
     def from_json(cls, data: str) -> ImmutableLedger:
         blocks_data: list[dict[str, Any]] = json.loads(data)
+        if not blocks_data:
+            raise ChainIntegrityError("Cannot restore an empty chain")
         ledger = cls.__new__(cls)
         ledger._chain = []
         for bd in blocks_data:
             block = Block.from_dict(bd)
             ledger._chain.append(block)
+        if ledger._chain[0].header.index != 0:
+            raise ChainIntegrityError(
+                f"First block must have index 0, got {ledger._chain[0].header.index}"
+            )
         ledger.validate_chain()
         return ledger

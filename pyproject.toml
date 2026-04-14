@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-chain"
-version = "0.1.0"
+version = "0.2.0"
 description = "Blockchain-structured AI Agent system with pipeline chaining, consensus validation, and immutable ledger"
 readme = "README.md"
 license = {text = "MIT"}

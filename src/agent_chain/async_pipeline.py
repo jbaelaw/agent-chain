@@ -1,31 +1,33 @@
-"""AgentPipeline -- sequential agent chaining with automatic block recording."""
+"""AsyncPipeline -- async sequential and parallel agent execution with ledger recording."""
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from .agent import BaseAgent, AgentResult
+from .agent import AgentResult
+from .async_agent import AsyncBaseAgent
 from .block import create_block
 from .ledger import ImmutableLedger
 from .events import EventBus, EventType
 
 
 @dataclass
-class PipelineStep:
+class AsyncPipelineStep:
     index: int
-    agent: BaseAgent
+    agent_id: str
+    role: str
     result: AgentResult
     block_hash: str
 
 
-class AgentPipeline:
-    """Runs agents in sequence; each result becomes the next agent's input
-    and is recorded as a block in the ledger."""
+class AsyncPipeline:
+    """Async sequential pipeline: agents run one after another."""
 
     def __init__(
         self,
-        agents: list[BaseAgent],
+        agents: list[AsyncBaseAgent],
         ledger: ImmutableLedger | None = None,
         event_bus: EventBus | None = None,
     ) -> None:
@@ -34,13 +36,13 @@ class AgentPipeline:
         self.agents = list(agents)
         self.ledger = ledger or ImmutableLedger()
         self.event_bus = event_bus or EventBus()
-        self._steps: list[PipelineStep] = []
+        self._steps: list[AsyncPipelineStep] = []
 
     @property
-    def steps(self) -> list[PipelineStep]:
+    def steps(self) -> list[AsyncPipelineStep]:
         return list(self._steps)
 
-    def run(self, initial_input: str, context: dict[str, Any] | None = None) -> AgentResult:
+    async def run(self, initial_input: str, context: dict[str, Any] | None = None) -> AgentResult:
         self._steps = []
         current_input = initial_input
         ctx = dict(context) if context else {}
@@ -55,7 +57,7 @@ class AgentPipeline:
                 "agent_id": agent.agent_id, "step": i,
             })
 
-            result = agent.execute(current_input, context=ctx)
+            result = await agent.execute(current_input, context=ctx)
 
             self.event_bus.emit(EventType.AGENT_END, {
                 "agent_id": agent.agent_id, "step": i,
@@ -81,9 +83,10 @@ class AgentPipeline:
                 "block_hash": block.block_hash,
             })
 
-            self._steps.append(PipelineStep(
+            self._steps.append(AsyncPipelineStep(
                 index=i,
-                agent=agent,
+                agent_id=agent.agent_id,
+                role=agent.role,
                 result=result,
                 block_hash=block.block_hash,
             ))
@@ -96,15 +99,3 @@ class AgentPipeline:
             "total_steps": len(self._steps),
         })
         return self._steps[-1].result
-
-    def summary(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "step": s.index,
-                "agent_id": s.agent.agent_id,
-                "role": s.agent.role,
-                "output_preview": s.result.output[:120],
-                "block_hash": s.block_hash,
-            }
-            for s in self._steps
-        ]

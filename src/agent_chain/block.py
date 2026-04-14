@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
-from .utils import sha256_hex, deterministic_json, utc_now, new_id
+from .utils import sha256_hex, deterministic_json, utc_now
 
 
 @dataclass(frozen=True)

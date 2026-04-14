@@ -2,16 +2,20 @@
 
 A blockchain-structured multi-agent orchestration framework in pure Python. Each agent's execution result is encapsulated as a cryptographically linked block, forming an append-only hash chain that provides tamper-evident auditability over the full execution history.
 
-The system combines three distinct mechanisms:
+The system combines five mechanisms:
 
 - **Pipeline chaining**: sequential execution of heterogeneous agents where each agent's output feeds the next agent's input
-- **Consensus validation**: a quorum-based voting protocol where designated validator agents approve or reject proposed results before they are committed
-- **Immutable ledger**: a SHA-256 hash-linked block chain recording every agent action, supporting full-chain integrity verification and JSON serialization
+- **Consensus validation**: a quorum-based voting protocol where designated validator agents approve or reject proposed results
+- **Immutable ledger**: a SHA-256 hash-linked block chain recording every agent action, with full-chain integrity verification
+- **Branching and fan-out**: conditional routing to named branches, or parallel execution of multiple branches with result aggregation
+- **Event hooks**: a publish/subscribe EventBus that fires on agent start/end, block creation, consensus votes, and pipeline lifecycle
+
+Both synchronous and asynchronous execution models are supported. Async consensus collects validator votes concurrently via `asyncio.gather`.
 
 ## Architecture
 
 ```
-                    Agent Pipeline
+                    Agent Pipeline (sync or async)
   +---------------------------------------------------+
   |  Agent_A ----block----> Agent_B ----block----> Agent_C  |
   +---------------------------|-------------------------+
@@ -26,6 +30,13 @@ The system combines three distinct mechanisms:
                   |   Immutable Ledger    |
                   | [B0]->[B1]->[B2]->[B3] |
                   | SHA-256 hash chain    |
+                  | Merkle root summary   |
+                  +-----------------------+
+                              |
+                  +-----------v-----------+
+                  |       EventBus        |
+                  | on(AGENT_START, fn)   |
+                  | on(BLOCK_CREATED, fn) |
                   +-----------------------+
 ```
 
@@ -33,7 +44,7 @@ The system combines three distinct mechanisms:
 
 ### `block.py` -- Block and BlockHeader
 
-`BlockHeader` is a frozen dataclass containing:
+`BlockHeader` is a frozen dataclass:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -43,65 +54,124 @@ The system combines three distinct mechanisms:
 | `agent_id` | `str` | Identifier of the agent that produced this block |
 | `nonce` | `int` | Reserved for future proof-of-work or ordering schemes |
 
-`Block` wraps a `BlockHeader` and an arbitrary `payload: dict[str, Any]`. The `block_hash` is computed automatically on construction by applying SHA-256 to the deterministic JSON serialization (sorted keys, no whitespace) of the combined header and payload. Both `BlockHeader` and `Block` are frozen (immutable after creation).
+`Block` wraps a `BlockHeader` and an arbitrary `payload: dict[str, Any]`. The `block_hash` is computed on construction by applying SHA-256 to the deterministic JSON serialization (sorted keys, no whitespace) of the combined header and payload. Both dataclasses are frozen (immutable after creation).
 
-`Block.from_dict()` performs hash verification on deserialization: if the recomputed hash does not match the stored `block_hash`, a `ValueError` is raised.
-
-`Block.genesis()` produces the initial block with `prev_hash` set to `"0" * 64` and `agent_id` set to `"genesis"`.
+`Block.from_dict()` performs hash verification on deserialization. `Block.genesis()` produces the initial block with `prev_hash = "0" * 64`.
 
 ### `ledger.py` -- ImmutableLedger
 
-An append-only container for `Block` objects. Initialized with a genesis block at index 0.
+Append-only container for `Block` objects, initialized with a genesis block.
 
-- `append(block)` -- validates that the block's `index` equals the current chain height and that its `prev_hash` matches the latest block's hash before appending. Raises `ChainIntegrityError` on mismatch.
-- `validate_chain()` -- iterates the full chain verifying index continuity, `prev_hash` linkage, and hash recomputation for every block. Returns `True` or raises `ChainIntegrityError`.
-- `export_json()` / `from_json()` -- full-chain serialization to/from JSON. `from_json` runs `validate_chain()` after reconstruction.
+- `append(block)` -- validates index continuity and `prev_hash` linkage before appending. Raises `ChainIntegrityError` on mismatch.
+- `validate_chain()` -- full-chain verification: index sequence, hash linkage, and per-block hash recomputation.
+- `export_json()` / `from_json()` -- serialization with validation on restore. Rejects empty chains and chains with non-zero starting index.
 
 ### `agent.py` -- BaseAgent, LLMAgent, AgentResult
 
-`BaseAgent` is an abstract class requiring subclasses to implement `execute(input_data: str, context: dict | None) -> AgentResult`. Each agent has a unique `agent_id` (auto-generated from role + UUID4 if not provided) and a `role` string.
+`BaseAgent(ABC)` requires `execute(input_data, context) -> AgentResult`. Each agent has an auto-generated unique `agent_id`.
 
-`LLMAgent` wraps any `LLMBackend` instance. When context is provided, it is prepended to the prompt as a key-value summary. The resulting `AgentResult` includes the raw output text, backend metadata, and an ISO 8601 timestamp.
+`LLMAgent` wraps any `LLMBackend`. Context is prepended as key-value pairs to the prompt.
 
-### `pipeline.py` -- AgentPipeline
+### `function_agent.py` -- FunctionAgent, AsyncFunctionAgent
 
-Accepts an ordered list of `BaseAgent` instances and an optional `ImmutableLedger`. Calling `run(initial_input, context)` executes each agent sequentially:
+`FunctionAgent` wraps any `Callable[[str, dict | None], str]` as a synchronous `BaseAgent`. `AsyncFunctionAgent` wraps sync or async callables for use in async pipelines.
 
-1. Agent_i receives the output of Agent_{i-1} (or `initial_input` for i=0)
-2. The result is wrapped as a `Block` with truncated input/output (500 chars) in the payload
-3. The block is appended to the ledger
-4. Context is updated with `prev_agent` and `prev_output` for downstream agents
+```python
+from agent_chain import FunctionAgent
 
-`summary()` returns a list of dicts with step index, agent ID, role, output preview, and block hash.
+def summarize(text: str, ctx=None) -> str:
+    return text[:100] + "..."
 
-### `consensus.py` -- ConsensusEngine
+agent = FunctionAgent(summarize, role="summarizer")
+result = agent.execute("long text here")
+```
 
-Accepts a list of validator agents and a configurable `threshold` (float in `(0, 1.0]`, default `0.5`).
+### `pipeline.py` / `async_pipeline.py` -- AgentPipeline, AsyncPipeline
 
-`propose_and_vote(proposal_agent_id, payload)` sends a structured validation prompt to every validator. Each validator's response is parsed into one of three `VoteDecision` values:
+Sequential agent execution with automatic block recording and EventBus integration.
 
-| Decision | Condition |
-|----------|-----------|
-| `APPROVE` | Response starts with "APPROVE" (case-insensitive) |
-| `REJECT` | Response starts with "REJECT" |
-| `ABSTAIN` | Response starts with "ABSTAIN" or is unparseable |
+1. Agent_i receives the output of Agent_{i-1}
+2. Each result is recorded as a block with truncated input/output in the payload
+3. Context is updated with `prev_agent` and `prev_output`
+4. Events are emitted: `PIPELINE_START`, `AGENT_START`, `AGENT_END`, `BLOCK_CREATED`, `PIPELINE_END`
 
-If `approve_count / total_votes >= threshold`, the payload is committed as a new block in the ledger. The `ConsensusRound` dataclass tracks votes, commitment status, and the resulting block hash.
+`run()` resets per-run state, making pipelines safely reentrant.
+
+### `branch_pipeline.py` -- BranchPipeline, AsyncFanOutPipeline
+
+**BranchPipeline**: a router function `(input, context) -> branch_name` selects which named branch to execute.
+
+```python
+from agent_chain import BranchPipeline
+
+pipeline = BranchPipeline(
+    router=lambda text, ctx: "fast" if len(text) < 100 else "thorough",
+    branches={
+        "fast": [quick_agent],
+        "thorough": [research_agent, analysis_agent],
+    },
+)
+result = pipeline.run("short input")
+```
+
+**AsyncFanOutPipeline**: runs all branches concurrently and returns a `dict[branch_name, AgentResult]`.
+
+### `consensus.py` / `async_consensus.py` -- ConsensusEngine, AsyncConsensusEngine
+
+Quorum-based voting with configurable `threshold` in `(0, 1.0]`.
+
+Vote parsing searches for APPROVE, REJECT, or ABSTAIN anywhere in the validator's response (case-insensitive). Unrecognized responses default to ABSTAIN.
+
+`AsyncConsensusEngine` collects all validator votes concurrently via `asyncio.gather`.
+
+### `merkle.py` -- Merkle Root
+
+`merkle_root(hashes)` computes a standard binary Merkle tree over a list of hex hash strings. Odd-length levels duplicate the last element.
+
+`chain_merkle_root(ledger)` computes the Merkle root over all block hashes in a ledger, providing a single 256-bit summary of the entire chain state.
+
+### `events.py` -- EventBus
+
+Publish/subscribe dispatcher with typed events:
+
+| EventType | Fired by |
+|-----------|----------|
+| `AGENT_START` / `AGENT_END` | Pipeline, AsyncPipeline |
+| `BLOCK_CREATED` | Pipeline, AsyncPipeline |
+| `PIPELINE_START` / `PIPELINE_END` | Pipeline, AsyncPipeline |
+| `PIPELINE_STEP` | Pipeline |
+| `CONSENSUS_START` / `CONSENSUS_VOTE` | ConsensusEngine, AsyncConsensusEngine |
+| `CONSENSUS_COMMIT` / `CONSENSUS_REJECT` | ConsensusEngine, AsyncConsensusEngine |
+
+```python
+from agent_chain import EventBus, EventType
+
+bus = EventBus()
+bus.on(EventType.BLOCK_CREATED, lambda et, data: print(f"Block: {data['block_hash'][:16]}"))
+bus.on_all(lambda et, data: log(et.value, data))
+```
 
 ### `llm/` -- LLM Backend Adapters
 
-All backends implement the `LLMBackend` abstract class with two methods: `name -> str` (property) and `generate(prompt, system_prompt) -> str`.
+Synchronous backends:
 
 | Class | Provider | API Endpoint | Auth |
 |-------|----------|-------------|------|
-| `OpenAIBackend` | OpenAI Chat Completions | `POST /v1/chat/completions` | `OPENAI_API_KEY` env var or constructor arg |
-| `AnthropicBackend` | Anthropic Messages | `POST /v1/messages` | `ANTHROPIC_API_KEY` env var or constructor arg |
-| `OllamaBackend` | Ollama (local) | `POST /api/generate` | None (default `http://localhost:11434`) |
+| `OpenAIBackend` | OpenAI Chat Completions | `POST /v1/chat/completions` | `OPENAI_API_KEY` |
+| `AnthropicBackend` | Anthropic Messages | `POST /v1/messages` | `ANTHROPIC_API_KEY` |
+| `OllamaBackend` | Ollama local | `POST /api/generate` | None |
 | `MockLLMBackend` | Deterministic mock | N/A | None |
 
-All HTTP backends use `httpx` with configurable `timeout`, `temperature`, and `max_tokens`. `base_url` is configurable for proxy or self-hosted deployments.
+Async backends:
 
-`MockLLMBackend` accepts an optional `responses: dict[str, str]` mapping keywords to canned responses (case-insensitive substring match on prompt), plus a `default` fallback string. It also records all calls in `call_log` for test assertions.
+| Class | Provider |
+|-------|----------|
+| `AsyncOpenAIBackend` | OpenAI (httpx.AsyncClient) |
+| `AsyncAnthropicBackend` | Anthropic (httpx.AsyncClient) |
+| `AsyncMockLLMBackend` | Deterministic async mock |
+| `SyncToAsyncAdapter` | Wraps any sync `LLMBackend` for async use |
+
+All HTTP backends support configurable `timeout`, `temperature`, `max_tokens`, and `base_url`.
 
 ## Project Structure
 
@@ -113,15 +183,25 @@ agent-chain/
             __init__.py
             block.py
             ledger.py
-            agent.py
-            pipeline.py
-            consensus.py
+            agent.py              # BaseAgent, LLMAgent
+            async_agent.py        # AsyncBaseAgent, AsyncLLMAgent
+            function_agent.py     # FunctionAgent, AsyncFunctionAgent
+            pipeline.py           # AgentPipeline (sync)
+            async_pipeline.py     # AsyncPipeline
+            consensus.py          # ConsensusEngine (sync)
+            async_consensus.py    # AsyncConsensusEngine
+            branch_pipeline.py    # BranchPipeline, AsyncFanOutPipeline
+            merkle.py             # merkle_root, chain_merkle_root
+            events.py             # EventBus, EventType
             utils.py
             llm/
                 __init__.py
-                base.py
+                base.py           # LLMBackend, MockLLMBackend
+                async_base.py     # AsyncLLMBackend, AsyncMockLLMBackend
                 openai.py
+                async_openai.py
                 anthropic.py
+                async_anthropic.py
                 ollama.py
     examples/
         demo_pipeline.py
@@ -130,13 +210,19 @@ agent-chain/
         test_ledger.py
         test_pipeline.py
         test_consensus.py
+        test_async_pipeline.py
+        test_branch_pipeline.py
+        test_function_agent.py
+        test_merkle.py
+        test_events.py
+        test_bugfixes.py
 ```
 
 ## Requirements
 
 - Python >= 3.11
-- Runtime dependency: `httpx >= 0.27`
-- Dev dependencies: `pytest >= 8.0`, `pytest-asyncio >= 0.23`
+- Runtime: `httpx >= 0.27`
+- Dev: `pytest >= 8.0`, `pytest-asyncio >= 0.23`
 
 ## Installation
 
@@ -148,78 +234,88 @@ pip install -e ".[dev]"
 
 ## Usage
 
-### Pipeline with Mock Backend
+### Sync Pipeline
 
 ```python
 from agent_chain import AgentPipeline, ImmutableLedger, LLMAgent
 from agent_chain.llm import MockLLMBackend
 
 ledger = ImmutableLedger()
+agents = [
+    LLMAgent(backend=MockLLMBackend(default="research done"), role="researcher"),
+    LLMAgent(backend=MockLLMBackend(default="analysis done"), role="analyst"),
+]
+pipeline = AgentPipeline(agents, ledger=ledger)
+result = pipeline.run("investigate topic")
 
-researcher = LLMAgent(
-    backend=MockLLMBackend(default="Quantum threats are real."),
-    role="researcher",
-)
-analyst = LLMAgent(
-    backend=MockLLMBackend(default="Migrate to PQC algorithms."),
-    role="analyst",
-)
-
-pipeline = AgentPipeline([researcher, analyst], ledger=ledger)
-result = pipeline.run("Assess quantum computing threats")
-
-assert result.output == "Migrate to PQC algorithms."
-assert ledger.height == 3   # genesis + 2 pipeline blocks
+assert ledger.height == 3
 assert ledger.validate_chain() is True
 ```
 
-### Consensus Validation
+### Async Pipeline
 
 ```python
-from agent_chain import ConsensusEngine, LLMAgent
-from agent_chain.llm import MockLLMBackend
+import asyncio
+from agent_chain import AsyncPipeline, AsyncLLMAgent
+from agent_chain.llm import AsyncMockLLMBackend
 
-validators = [
-    LLMAgent(backend=MockLLMBackend(default="APPROVE - looks correct"), role="validator")
-    for _ in range(3)
+agents = [
+    AsyncLLMAgent(backend=AsyncMockLLMBackend(default="step1"), role="a"),
+    AsyncLLMAgent(backend=AsyncMockLLMBackend(default="step2"), role="b"),
 ]
+pipeline = AsyncPipeline(agents)
+result = asyncio.run(pipeline.run("start"))
+```
 
-engine = ConsensusEngine(validators, ledger=ledger, threshold=0.67)
-round_ = engine.propose_and_vote(
-    proposal_agent_id=analyst.agent_id,
-    payload={"report": result.output},
+### FunctionAgent
+
+```python
+from agent_chain import FunctionAgent, AgentPipeline
+
+pipeline = AgentPipeline([
+    FunctionAgent(lambda text, ctx: text.upper(), role="upper"),
+    FunctionAgent(lambda text, ctx: f"[DONE] {text}", role="tag"),
+])
+result = pipeline.run("hello world")
+assert result.output == "[DONE] HELLO WORLD"
+```
+
+### BranchPipeline
+
+```python
+from agent_chain import BranchPipeline
+
+pipeline = BranchPipeline(
+    router=lambda text, ctx: "short" if len(text) < 50 else "long",
+    branches={"short": [fast_agent], "long": [deep_agent, review_agent]},
 )
-
-assert round_.committed is True
-assert engine.tally(round_) == {"approve": 3, "reject": 0, "abstain": 0}
 ```
 
-### Using Real LLM Backends
+### Merkle Root
 
 ```python
-from agent_chain.llm import OpenAIBackend, AnthropicBackend, OllamaBackend
+from agent_chain import chain_merkle_root
 
-agent_gpt = LLMAgent(backend=OpenAIBackend(model="gpt-4o"), role="analyst")
-agent_claude = LLMAgent(backend=AnthropicBackend(model="claude-sonnet-4-20250514"), role="reviewer")
-agent_local = LLMAgent(backend=OllamaBackend(model="llama3"), role="summarizer")
+root = chain_merkle_root(ledger)  # single 256-bit summary of entire chain
 ```
 
-### Ledger Serialization
+### EventBus
 
 ```python
-json_str = ledger.export_json()
-restored = ImmutableLedger.from_json(json_str)
-assert restored.height == ledger.height
-assert restored.validate_chain() is True
+from agent_chain import EventBus, EventType, AgentPipeline
+
+bus = EventBus()
+bus.on(EventType.BLOCK_CREATED, lambda et, d: print(d["block_hash"][:16]))
+
+pipeline = AgentPipeline(agents, event_bus=bus)
+pipeline.run("input")
 ```
 
-## Running the Demo
+## Demo
 
 ```bash
 python examples/demo_pipeline.py
 ```
-
-The demo runs a 3-agent pipeline (researcher, analyst, writer) followed by a 3-validator consensus round, using only `MockLLMBackend`. No API keys are required.
 
 ## Tests
 
@@ -227,7 +323,29 @@ The demo runs a 3-agent pipeline (researcher, analyst, writer) followed by a 3-v
 pytest tests/ -v
 ```
 
-29 tests covering block hashing, ledger integrity, pipeline execution, and consensus voting.
+70 tests covering block hashing, ledger integrity, sync/async pipelines, consensus, branching, function agents, Merkle trees, event bus, and regression tests for v0.1 bug fixes.
+
+## Changelog
+
+### v0.2.0
+
+New features:
+- `AsyncPipeline`, `AsyncConsensusEngine` with concurrent validator voting
+- `AsyncLLMBackend`, `AsyncMockLLMBackend`, `AsyncOpenAIBackend`, `AsyncAnthropicBackend`, `SyncToAsyncAdapter`
+- `FunctionAgent` / `AsyncFunctionAgent` for wrapping plain callables as agents
+- `BranchPipeline` (conditional routing) and `AsyncFanOutPipeline` (parallel branch execution)
+- `merkle_root()` / `chain_merkle_root()` for Merkle tree chain summaries
+- `EventBus` with typed events integrated into Pipeline and ConsensusEngine
+
+Bug fixes:
+- `pipeline.run()` now resets per-run state (was accumulating across calls)
+- `ImmutableLedger.from_json()` rejects empty chains and non-zero starting index
+- `ConsensusEngine._parse_vote()` searches for keywords anywhere in output (was only checking prefix)
+- Removed dead imports in `block.py` and `llm/openai.py`
+
+### v0.1.0
+
+Initial release with sync pipeline, consensus, immutable ledger, and LLM backends.
 
 ## License
 

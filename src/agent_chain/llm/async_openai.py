@@ -1,4 +1,4 @@
-"""OpenAI API backend."""
+"""Async OpenAI backend using httpx.AsyncClient."""
 
 from __future__ import annotations
 
@@ -6,11 +6,10 @@ import os
 
 import httpx
 
-from .base import LLMBackend
+from .async_base import AsyncLLMBackend
 
 
-class OpenAIBackend(LLMBackend):
-    """OpenAI Chat Completions adapter."""
+class AsyncOpenAIBackend(AsyncLLMBackend):
 
     def __init__(
         self,
@@ -33,7 +32,7 @@ class OpenAIBackend(LLMBackend):
     def name(self) -> str:
         return f"openai/{self._model}"
 
-    def generate(self, prompt: str, system_prompt: str = "") -> str:
+    async def agenerate(self, prompt: str, system_prompt: str = "") -> str:
         if not self._api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -42,20 +41,21 @@ class OpenAIBackend(LLMBackend):
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        resp = httpx.post(
-            f"{self._base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self._model,
-                "messages": messages,
-                "temperature": self._temperature,
-                "max_tokens": self._max_tokens,
-            },
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self._base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self._model,
+                    "messages": messages,
+                    "temperature": self._temperature,
+                    "max_tokens": self._max_tokens,
+                },
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]

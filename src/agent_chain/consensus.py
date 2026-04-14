@@ -1,4 +1,4 @@
-"""ConsensusEngine — validator-based voting and verification for blocks."""
+"""ConsensusEngine -- validator-based voting and verification for blocks."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any
 from .agent import BaseAgent, AgentResult
 from .block import Block, create_block
 from .ledger import ImmutableLedger
+from .events import EventBus, EventType
 from .utils import utc_now
 
 
@@ -52,6 +53,7 @@ class ConsensusEngine:
         validators: list[BaseAgent],
         ledger: ImmutableLedger | None = None,
         threshold: float = 0.5,
+        event_bus: EventBus | None = None,
     ) -> None:
         if not validators:
             raise ValueError("At least one validator is required")
@@ -60,6 +62,7 @@ class ConsensusEngine:
         self.validators = list(validators)
         self.ledger = ledger or ImmutableLedger()
         self.threshold = threshold
+        self.event_bus = event_bus or EventBus()
         self._rounds: list[ConsensusRound] = []
 
     @property
@@ -77,6 +80,11 @@ class ConsensusEngine:
             proposal_agent_id=proposal_agent_id,
             payload=payload,
         )
+
+        self.event_bus.emit(EventType.CONSENSUS_START, {
+            "proposal_agent_id": proposal_agent_id,
+            "validator_count": len(self.validators),
+        })
 
         prompt = (
             f"You are a validator. Review this agent output and decide: "
@@ -97,24 +105,41 @@ class ConsensusEngine:
             )
             round_.votes.append(vote)
 
+            self.event_bus.emit(EventType.CONSENSUS_VOTE, {
+                "validator_id": validator.agent_id,
+                "decision": decision.value,
+            })
+
         if self._quorum_reached(round_):
             block = self._commit(round_)
             round_.committed = True
             round_.block_hash = block.block_hash
+            self.event_bus.emit(EventType.CONSENSUS_COMMIT, {
+                "block_hash": block.block_hash,
+            })
+        else:
+            self.event_bus.emit(EventType.CONSENSUS_REJECT, {
+                "approve_count": sum(
+                    1 for v in round_.votes if v.decision == VoteDecision.APPROVE
+                ),
+                "total": len(round_.votes),
+            })
 
         self._rounds.append(round_)
         return round_
 
-    def _parse_vote(self, output: str) -> tuple[VoteDecision, str]:
-        text = output.strip().upper()
-        if text.startswith("APPROVE"):
-            return VoteDecision.APPROVE, output.strip()
-        elif text.startswith("REJECT"):
-            return VoteDecision.REJECT, output.strip()
-        elif text.startswith("ABSTAIN"):
-            return VoteDecision.ABSTAIN, output.strip()
-        # Default: treat unrecognised output as abstain
-        return VoteDecision.ABSTAIN, f"(unparseable) {output.strip()}"
+    @staticmethod
+    def _parse_vote(output: str) -> tuple[VoteDecision, str]:
+        stripped = output.strip()
+        upper = stripped.upper()
+        for keyword, decision in [
+            ("APPROVE", VoteDecision.APPROVE),
+            ("REJECT", VoteDecision.REJECT),
+            ("ABSTAIN", VoteDecision.ABSTAIN),
+        ]:
+            if keyword in upper:
+                return decision, stripped
+        return VoteDecision.ABSTAIN, f"(unparseable) {stripped}"
 
     def _quorum_reached(self, round_: ConsensusRound) -> bool:
         approve_count = sum(1 for v in round_.votes if v.decision == VoteDecision.APPROVE)
